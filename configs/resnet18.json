@@ -1,0 +1,32 @@
+{
+  "data": {
+    "image_dir": "/home/szdx/LNX/data/TA/Healthy/Images",
+    "characteristics": "/home/szdx/LNX/data/TA/characteristics.xlsx",
+    "sheet_name": "Blad1",
+    "bins": [18, 45, 60, 101],
+    "class_names": ["18-44", "45-59", "60-100"],
+    "split": {
+      "train": 0.7,
+      "val": 0.15,
+      "test": 0.15
+    }
+  },
+  "model": {
+    "name": "resnet18",
+    "pretrained": true,
+    "num_classes": 3
+  },
+  "train": {
+    "epochs": 30,
+    "batch_size": 32,
+    "num_workers": 4,
+    "image_size": 224,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "use_class_weights": true,
+    "seed": 42,
+    "device": "cuda"
+  },
+  "output_root": "outputs",
+  "run_name": "resnet18_baseline"
+}
