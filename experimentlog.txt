@@ -1,0 +1,462 @@
+# stage-age 项目实验历程日志
+
+生成时间：2026-05-13 11:32:58（Asia/Shanghai）
+项目路径：/home/szdx/LNX/stage-age
+GitHub 仓库：https://github.com/CShrimp0/stage_age
+
+这份文件用于给后续 agent 快速理解 stage-age 项目从 0 到当前的实验进程、关键决策、失败路线、当前主线和下一步方向。它不是论文结果表，而是项目进展日志。
+
+---
+
+## 1. 项目背景
+
+目标：基于 TA 健康人群超声图像预测年龄阶段，当前主任务是三分类。
+
+当前主分组：
+- 18-44
+- 45-64
+- 65-100
+
+固定数据：
+- 图像目录：/home/szdx/LNX/data/TA/Healthy/Images
+- 年龄与基本信息：/home/szdx/LNX/data/TA/characteristics.xlsx
+- sheet_name：Blad1
+
+评价原则：
+- 必须使用 subject-level split，严禁 image-level split。
+- 同一 subject 不得跨 train/val/test。
+- 训练、验证、测试按 subject 划分，避免同一受试者图像泄露。
+- 测试结果必须来自 best.pt，而不是 final epoch。
+- best.pt 按验证集指标选择：分类实验通常按 val_macro_f1，回归再分箱实验按 val_mae。
+- 核心指标：subject-level macro-F1 和 subject-level balanced accuracy。
+- subject-level 预测方式：同一 subject 的多张图像先聚合，再得到 subject 级预测；分类为概率平均后 argmax，回归为预测年龄平均后再分箱。
+
+当前主要实现习惯：
+- 尽量复用现有脚本，避免无限增加新脚本。
+- 多 GPU 不使用 DDP；使用“一张 GPU 跑一个独立 seed-run”的任务队列。
+- 所有新输出目录必须包含完整时间戳，禁止覆盖已有 outputs。
+
+---
+
+## 2. 实验时间轴
+
+### 阶段 1：ResNet18 baseline
+
+最初目标是先建立一个可解释、易复现的 CNN 基线。使用 TA 健康人群超声图像和年龄标签，先做 ResNet18 三分类。
+
+早期做过 45/60 分界：
+- 输出目录：outputs/failure/20260511_152105_resnet18_baseline
+- bins：[18, 45, 60, 101]
+- subject macro-F1：0.5727
+- 结论：45/60 旧分界较弱，且后续主分界改为 45/65，因此已归档为历史参考。
+
+随后切换到当前主分界 45/65：
+- 当前 bins：[18, 45, 65, 101]
+- class_names：["18-44", "45-64", "65-100"]
+
+45/65 单次 split 最好结果：
+- 输出目录：outputs/20260511_152330_resnet18_age45_65
+- subject macro-F1：0.6488
+- 说明：这是单次 split，不能直接替代 multi-seed 稳定性结论。
+
+ResNet18 multi-seed baseline：
+- 输出目录：outputs/20260511_160714_resnet18_baseline_age45_65_multiseed
+- seeds：42 / 43 / 44
+- subject macro-F1：0.6313 ± 0.0417
+- subject balanced accuracy：0.6368 ± 0.0420
+
+观察：
+- ResNet18 训练曲线显示明显过拟合。
+- 单次 split 可以到 0.6488，但 multi-seed 均值回落到 0.6313。
+- 后续所有模型都应以 multi-seed subject-level 结果为主要判断依据。
+
+---
+
+### 阶段 2：引入 USFM
+
+动机：ResNet18 是自然图像预训练模型，对超声图像迁移能力有限；希望使用本地 USFM 大模型作为超声特征提取器，提高泛化能力。
+
+USFM 路径：
+- checkpoint：/home/szdx/LNX/stage-age/USFM_latest.pth
+- adapter：/home/szdx/LNX/usage_predict_autoresearch/usfm_adapter.py
+
+实现路线：
+1. USFM linear probe
+   - 冻结 USFM backbone，只训练线性分类头。
+   - 结果偏弱，说明线性头表达能力不足。
+
+2. USFM MLP probe
+   - 冻结 USFM backbone，只训练 MLP 分类头。
+   - 结果明显接近 ResNet18 baseline，并略优于 ResNet18 multi-seed baseline。
+
+3. USFM partial last block
+   - 加载 USFM 权重。
+   - 冻结大部分 backbone。
+   - 只解冻 encoder.blocks.11 和 encoder.fc_norm。
+   - 同时训练 MLP 分类头。
+   - 禁止全量 fine-tune。
+
+关键结果：
+- USFM linear probe：0.5802 ± 0.0570
+  - 目录：outputs/failure/20260511_161304_usfm_linear_probe_age45_65_multiseed
+  - 结论：只训线性头太弱，已归档。
+
+- USFM MLP probe：0.6434 ± 0.0225
+  - 目录：outputs/20260511_161907_usfm_mlp_probe_age45_65_multiseed
+  - subject balanced accuracy：0.6645 ± 0.0130
+  - 结论：USFM 冻结特征已有价值，但还不够。
+
+- USFM partial last block：0.6471 ± 0.0237
+  - 目录：outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed
+  - subject balanced accuracy：0.6829 ± 0.0325
+  - 结论：当前主线最佳模型。
+
+当前主线模型：USFM partial last block。
+当前主线关键设置：只解冻 encoder.blocks.11 和 encoder.fc_norm，加 MLP 分类头。
+
+---
+
+### 阶段 3：ResNet18 超参寻优
+
+动机：ResNet18 baseline 有过拟合，希望通过小规模正则化和冻结策略提升 multi-seed 稳定性。
+
+尝试过的方向包括：
+- 更低 lr
+- 更大 weight decay
+- label smoothing
+- freeze layer1/layer2
+- discriminative learning rate
+- 只训练 layer4/fc
+
+关键结果：
+- resnet18_discriminative_lr
+  - 目录：outputs/20260511_164847_resnet18_discriminative_lr_age45_65_hparam
+  - subject macro-F1：0.6259 ± 0.0160
+  - subject balanced accuracy：0.6468 ± 0.0086
+
+- resnet18_reg_b
+  - 目录：outputs/20260511_164847_resnet18_reg_b_age45_65_hparam
+  - subject macro-F1：0.6259 ± 0.0050
+  - subject balanced accuracy：0.6454 ± 0.0252
+
+归档的 ResNet18 低价值配置：
+- resnet18_reg_a：0.5911 ± 0.0210
+- resnet18_freeze12：0.5969 ± 0.0074
+- resnet18_layer4_only：0.6023 ± 0.0181
+- resnet18_layer4_only_strongwd：0.5994 ± 0.0187
+
+结论：
+- ResNet18 调参可以改变稳定性，但均值没有超过 ResNet18 baseline。
+- ResNet18 适合作为对照组，不再作为主攻方向。
+
+---
+
+### 阶段 4：USFM partial last block 的小范围调参
+
+动机：当前主线 USFM partial last block 已是最佳，因此进一步围绕它做小范围优化。
+
+尝试方向：
+- label smoothing + 不同 backbone_lr
+- fixed-threshold ordinal classification
+
+结果：
+- usfm_partial_ls_lr1e5
+  - 目录：outputs/failure/20260512_170016_usfm_partial_ls_lr1e5_age45_65_multiseed
+  - subject macro-F1：0.6077 ± 0.0202
+  - subject balanced accuracy：0.6424 ± 0.0302
+  - 结论：backbone_lr 太低且 label smoothing 后明显欠拟合。
+
+- usfm_partial_ls_lr3e5
+  - 目录：outputs/failure/20260512_170016_usfm_partial_ls_lr3e5_age45_65_multiseed
+  - subject macro-F1：0.6323 ± 0.0271
+  - subject balanced accuracy：0.6658 ± 0.0312
+  - 结论：接近但仍低于主线，label smoothing 不值得继续。
+
+- usfm_partial_ls_lr5e5
+  - 目录：outputs/failure/20260512_170016_usfm_partial_ls_lr5e5_age45_65_multiseed
+  - subject macro-F1：0.6307 ± 0.0343
+  - subject balanced accuracy：0.6716 ± 0.0173
+  - 结论：balanced accuracy 尚可，但 macro-F1 没上去，不作为主线。
+
+- usfm_partial_ordinal_lr3e5
+  - 目录：outputs/failure/20260512_170016_usfm_partial_ordinal_lr3e5_age45_65_multiseed
+  - subject macro-F1：0.5773 ± 0.0290
+  - subject balanced accuracy：0.6284 ± 0.0349
+  - 结论：固定阈值 ordinal 方案明显偏弱。
+
+阶段结论：
+- 普通 label smoothing 没有超过原始 USFM partial last block。
+- fixed-threshold ordinal classification 明显偏弱。
+- 后续不应重复这两条路线，除非有新假设，例如 boundary-aware soft label 而不是普通 label smoothing。
+
+---
+
+### 阶段 5：回归再分箱 / focal loss / 中间类加权
+
+动机：45-64 中间组仍然是瓶颈，希望通过更关注难样本或中间类来改善召回和 F1。
+
+#### 5.1 Focal loss
+
+- 目录：outputs/20260512_173950_usfm_partial_focal_loss_age45_65_multiseed
+- subject macro-F1：0.6300 ± 0.0335
+- subject balanced accuracy：0.6555 ± 0.0351
+- 45-64 subject F1：0.4950 ± 0.0438
+- 45-64 subject recall：0.4211 ± 0.0351
+
+结论：
+- focal loss 对 45-64 有一点帮助，但整体不超过主线。
+- 暂不作为主路线。
+
+#### 5.2 45-64 class weight 上调 1.3
+
+- 目录：outputs/20260512_173950_usfm_partial_midclass_weight_1p3_age45_65_multiseed
+- subject macro-F1：0.6383 ± 0.0599
+- subject balanced accuracy：0.6521 ± 0.0660
+- 45-64 subject F1：0.5339 ± 0.0808
+- 45-64 subject recall：0.4854 ± 0.0966
+
+结论：
+- 本阶段三组实验中 macro-F1 最高。
+- 中间类 F1 有提升，但 seed 间波动较大，整体仍低于 USFM partial last block 主线。
+- 可以作为“提高中间类”的参考，但不是当前最佳模型。
+
+#### 5.3 年龄回归再分箱
+
+- 目录：outputs/20260512_173950_usfm_partial_regression_binning_age45_65_multiseed
+- save_best_by：val_mae
+- subject macro-F1：0.6139 ± 0.0279
+- subject balanced accuracy：0.5992 ± 0.0279
+- 45-64 subject F1：0.6021 ± 0.0321
+- 45-64 subject recall：0.6725 ± 0.0365
+- subject MAE：8.5001 ± 0.3331
+- subject RMSE：10.4698 ± 0.4477
+- subject Pearson：0.7577 ± 0.0202
+
+结论：
+- 年龄连续性确实有信息：subject Pearson 约 0.76。
+- 45-64 recall 明显提高，是所有近期方案里最突出的一点。
+- 但分箱后整体 macro-F1 和 balanced accuracy 下降，不适合作为当前最优分类器。
+- 这个结果提示：后续可以考虑 boundary-aware soft label 或 label distribution learning，而不是简单三分类硬标签。
+
+---
+
+### 阶段 6：outputs/failure 整理
+
+已将明确失败或低价值、不再纳入正式主线对比的实验移动到：
+- /home/szdx/LNX/stage-age/outputs/failure
+
+已更新：
+- /home/szdx/LNX/stage-age/outputs/trainlog
+- /home/szdx/LNX/stage-age/outputs/failure/trainlog
+- /home/szdx/LNX/stage-age/outputs/trainlog.xlsx
+- /home/szdx/LNX/stage-age/outputs/failure/trainlog.xlsx
+
+归档原因大致分为：
+- 旧分界，不再作为主任务。
+- 线性 probe 太弱。
+- ResNet18 调参未超过 baseline。
+- label smoothing 未超过主线。
+- fixed-threshold ordinal 明显偏弱。
+- 不完整或源路径缺失。
+
+特别说明：
+- outputs/20260511_164630_resnet18_reg_b_age45_65_hparam 在整理时源路径已不存在，只能在 failure/trainlog 和 README 中记录为 missing/incomplete，未纳入正式汇总。
+
+---
+
+## 3. 当前结论
+
+当前最佳主线：
+- 模型：USFM partial last block
+- 目录：outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed
+- subject macro-F1：0.6471 ± 0.0237
+- subject balanced accuracy：0.6829 ± 0.0325
+- 解冻层：encoder.blocks.11 和 encoder.fc_norm
+
+当前尚未达到：
+- subject macro-F1 0.68
+- subject macro-F1 0.70
+
+已观察到的事实：
+- ResNet18 搜索收益有限。
+- USFM MLP probe 已接近主线，说明 USFM 特征有效。
+- USFM partial last block 是当前最稳方案。
+- 普通 label smoothing 没有收益。
+- fixed-threshold ordinal 分类明显弱。
+- focal loss 无明显收益。
+- 45-64 class weight 上调能改善中间类，但不稳定。
+- 回归再分箱能显著提高 45-64 recall，但整体分类指标下降。
+- 45-64 中间年龄段仍是主要瓶颈。
+- 年龄连续性有价值，但不能直接用简单回归分箱替代当前分类器。
+
+---
+
+## 4. 后续计划 / 建议方向
+
+### 4.1 subject-level multi-image pooling
+
+这是当前最值得推进的方向。
+
+动机：
+- 当前训练基本是 image-level，但评价核心是 subject-level。
+- 每个 subject 有多张图，直接在 subject-level 聚合训练可能更匹配最终指标。
+
+建议实现：
+- 一个 batch 中以 subject 为单位采样。
+- 每个 subject 输入 K 张图。
+- K 张图共享同一个 USFM encoder。
+- 图像特征经过 mean pooling 或 attention pooling。
+- pooling 后接 subject-level 分类头。
+
+预期收益：
+- 减少单张图像噪声。
+- 更贴近 subject-level test 方式。
+- 可能提升稳定性，尤其是中间年龄段。
+
+注意：
+- split 仍必须 subject-level。
+- K 张图只能来自同一 subject。
+- test subject 绝不能进入训练或预训练。
+
+### 4.2 boundary-aware soft label
+
+这不是普通 label smoothing。
+
+动机：
+- 年龄是连续变量，45 和 65 岁附近样本存在天然标签模糊性。
+- 普通 label smoothing 对所有样本平均软化，已经验证效果不好。
+- 应只对靠近 45/65 边界的样本软化。
+
+建议：
+- 对远离边界的样本仍使用接近 one-hot 的标签。
+- 对靠近 45 或 65 的样本，根据距离边界的年龄差分配相邻类概率。
+- 可参考 age estimation 的 label distribution learning / ordinal soft labels。
+
+预期收益：
+- 保留年龄连续性信息。
+- 比 regression binning 更适合分类目标。
+- 可能缓解 45-64 边界样本误判。
+
+### 4.3 ensemble 作为补充试验
+
+用途：
+- 不作为主创新。
+- 用于估计不同模型的互补上限。
+
+可融合模型：
+- USFM partial last block
+- USFM MLP probe
+- regression binning
+- midclass weight 方案
+
+建议：
+- 只做后处理或轻量加权融合。
+- 不要把 ensemble 当主要贡献点。
+
+### 4.4 患病组 / 额外数据预训练
+
+可以考虑，但必须非常小心泄露。
+
+原则：
+- 每个 seed 内只能使用 train subjects 或外部不重叠 subjects 做预训练。
+- test subjects 不能以任何形式参与训练、预训练、阈值拟合、特征归一化拟合。
+- 如果使用患病组，需要明确记录 subject ID 是否与 test 重叠。
+
+### 4.5 hard-case 分析
+
+建议做，但只用于解释和诊断。
+
+方向：
+- 找出多 seed 都预测错误的 subject。
+- 分析年龄段、图像质量、view、性别、边界年龄等因素。
+- 检查是否集中在 45/65 边界附近。
+
+禁止：
+- 不建议直接改标签。
+- 不建议直接删除 hard cases。
+- 防止从模型误差反向污染标签。
+
+---
+
+## 5. 代码和运行习惯
+
+后续优先复用：
+- src/stage_age/run_next_stage_experiments.py
+- src/stage_age/run_multiseed_experiments.py
+- src/stage_age/train_usfm_variants.py
+- src/stage_age/usfm.py
+
+运行习惯：
+- 后续尽量少新增脚本，避免 src/stage_age 目录臃肿。
+- 多 GPU 策略：不使用 DDP；使用 GPU worker queue，一张 GPU 一个独立 seed-run。
+- 每个 seed-run 是独立进程，通过 CUDA_VISIBLE_DEVICES 指定单卡。
+- 所有新输出目录必须包含完整时间戳。
+- 不覆盖已有 outputs。
+- 不修改原始数据。
+- 新实验完成后同步更新 trainlog / trainlog.xlsx。
+
+当前常用入口：
+- PYTHONPATH=src python -m stage_age.run_next_stage_experiments --experiment all_next --seeds 42 43 44 --gpus 0 1 2 3 4 5 --max_parallel 6
+
+---
+
+## 6. 已核验的主要来源文件
+
+本日志中的结果优先来自以下文件：
+- outputs/trainlog
+- outputs/failure/trainlog
+- outputs/20260511_152330_resnet18_age45_65/result.md
+- outputs/failure/20260511_152105_resnet18_baseline/result.md
+- outputs/20260511_160714_resnet18_baseline_age45_65_multiseed/summary.csv
+- outputs/20260511_161907_usfm_mlp_probe_age45_65_multiseed/summary.csv
+- outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed/summary.csv
+- outputs/20260511_164847_resnet18_discriminative_lr_age45_65_hparam/summary.csv
+- outputs/20260511_164847_resnet18_reg_b_age45_65_hparam/summary.csv
+- outputs/20260512_173950_usfm_partial_focal_loss_age45_65_multiseed/summary.csv
+- outputs/20260512_173950_usfm_partial_midclass_weight_1p3_age45_65_multiseed/summary.csv
+- outputs/20260512_173950_usfm_partial_regression_binning_age45_65_multiseed/summary.csv
+- outputs/failure/20260511_161304_usfm_linear_probe_age45_65_multiseed/summary.csv
+- outputs/failure/20260511_164352_resnet18_reg_a_age45_65_hparam/summary.csv
+- outputs/failure/20260511_164847_resnet18_freeze12_age45_65_hparam/summary.csv
+- outputs/failure/20260511_164847_resnet18_layer4_only_age45_65_hparam/summary.csv
+- outputs/failure/20260511_164847_resnet18_layer4_only_strongwd_age45_65_hparam/summary.csv
+- outputs/failure/20260512_170016_usfm_partial_ls_lr1e5_age45_65_multiseed/summary.csv
+- outputs/failure/20260512_170016_usfm_partial_ls_lr3e5_age45_65_multiseed/summary.csv
+- outputs/failure/20260512_170016_usfm_partial_ls_lr5e5_age45_65_multiseed/summary.csv
+- outputs/failure/20260512_170016_usfm_partial_ordinal_lr3e5_age45_65_multiseed/summary.csv
+
+待核验 / 特别说明：
+- GitHub 仓库 URL 来自用户指定，本日志未联网核验远端状态。
+- outputs/20260511_164630_resnet18_reg_b_age45_65_hparam 在整理时源路径已不存在；只保留 missing/incomplete 记录，未纳入正式结果。
+
+---
+
+## 7. 给后续 agent 的注意事项
+
+1. 不要重新做已经失败的路线，除非有清晰的新假设。
+   - 普通 label smoothing 已经验证无收益。
+   - fixed-threshold ordinal 已经明显偏弱。
+   - ResNet18 小规模正则/冻结搜索未超过 baseline。
+
+2. 不要使用 image-level split。
+   - 本项目所有正式结论必须 subject-level split。
+   - 同一 subject 不得跨 train/val/test。
+
+3. 不要让 test subject 参与任何训练或预训练。
+   - 包括 supervised training、self-supervised pretraining、normalization fitting、threshold tuning、ensemble 权重拟合。
+
+4. 不要把 ensemble 当主创新。
+   - ensemble 可以估计上限或做补充，但主线应优先改进单模型或训练范式。
+
+5. 不要直接用 hard-case 改标签。
+   - hard-case 应用于解释分析，不应用于反向污染标签。
+
+6. 当前最值得推进的方向：
+   - subject-level multi-image pooling
+   - boundary-aware soft label
+
+7. 当前主线参照：
+   - USFM partial last block
+   - outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed
+   - subject macro-F1：0.6471 ± 0.0237
+   - subject balanced accuracy：0.6829 ± 0.0325
