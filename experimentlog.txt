@@ -460,3 +460,53 @@ USFM 路径：
    - outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed
    - subject macro-F1：0.6471 ± 0.0237
    - subject balanced accuracy：0.6829 ± 0.0325
+
+---
+
+## 8. 2026-05-13 LDL 对比实验补充
+
+本阶段目标：
+- 在当前最佳模型 USFM partial last block 的基础上，比较 hard label 与 LDL soft label。
+- LDL 的动机是年龄连续，但当前标签被硬切成 18-44 / 45-64 / 65-100；45 和 65 岁边界附近样本存在天然模糊性。
+- 测试阶段仍使用原始 hard label 评价，保证与主线 hard-label baseline 可比。
+
+实验入口：
+- src/stage_age/run_next_stage_experiments.py
+- 命令：PYTHONPATH=src python -m stage_age.run_next_stage_experiments --experiment all_ldl --seeds 42 43 44 --gpus 0 1 2 3 4 5 --parallel_per_gpu 1 --max_parallel 6
+
+实验结果：
+- usfm_partial_ldl_boundary_w3
+  - 输出：outputs/20260513_120334_usfm_partial_ldl_boundary_w3_age45_65_multiseed
+  - subject macro-F1：0.6280 ± 0.0241
+  - subject balanced accuracy：0.6700 ± 0.0192
+  - 45-64 subject F1：0.4629 ± 0.0951
+  - 45-64 subject recall：0.3743 ± 0.1168
+
+- usfm_partial_ldl_gaussian_sigma3
+  - 输出：outputs/20260513_120334_usfm_partial_ldl_gaussian_sigma3_age45_65_multiseed
+  - subject macro-F1：0.6103 ± 0.0390
+  - subject balanced accuracy：0.6611 ± 0.0402
+  - 45-64 subject F1：0.4223 ± 0.0896
+  - 45-64 subject recall：0.3275 ± 0.0966
+
+- usfm_partial_ldl_multitask_w3_lam0p3
+  - 输出：outputs/20260513_120334_usfm_partial_ldl_multitask_w3_lam0p3_age45_65_multiseed
+  - subject macro-F1：0.6294 ± 0.0350
+  - subject balanced accuracy：0.6453 ± 0.0204
+  - 45-64 subject F1：0.5436 ± 0.0756
+  - 45-64 subject recall：0.4971 ± 0.1114
+  - subject MAE / RMSE / Pearson：8.9980 / 11.1257 / 0.7442
+
+LDL 结论：
+- LDL 系列没有超过当前主线 USFM partial last block。
+- 当前主线仍是 outputs/20260511_162523_usfm_partial_last_block_age45_65_multiseed：
+  - subject macro-F1：0.6471 ± 0.0237
+  - subject balanced accuracy：0.6829 ± 0.0325
+- LDL multitask 明显改善了 45-64 F1 / recall，并且 boundary_45 / boundary_65 的局部表现更好，但整体 subject macro-F1 仍未超过主线。
+- 单独 boundary soft label 和 gaussian LDL 没有带来整体收益。
+- LDL 值得作为后续组合项保留，尤其是与 subject-level pooling 结合，但不应单独替代当前主线。
+
+下一步：
+- 进入 subject-level multi-image pooling 阶段。
+- 目标是把训练单位从 image 改为 subject：一个 subject 的多张图像共享 USFM encoder 后进行 mean pooling 或 attention pooling，再预测 subject 年龄阶段。
+- 这是当前最值得推进的训练范式方向，因为正式评价本来就是 subject-level。
